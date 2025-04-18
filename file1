@@ -1,13 +1,20 @@
 #cloud-config
 users:
   - name: altlinux
+    groups: sudo
     lock_passwd: false
-    plain_text_passwd: "P@ssw0rd"
     sudo: ALL=(ALL) NOPASSWD:ALL
     shell: /bin/bash
-    ssh_pwauth: true
+    plain_text_passwd: "P@ssw0rd"
     ssh_authorized_keys:
-    
+      - ssh-rsa ...
 
-ssh_pwauth: true
-disable_root: true
+# Установка и настройка SSH-сервера
+packages:
+  - openssh-server
+
+# Настройка SSH
+runcmd:
+  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
+  - systemctl restart sshd
