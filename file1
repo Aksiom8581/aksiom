@@ -1,18 +1,184 @@
-#cloud-config
-users:
-  - name: altlinux
-    groups: sudo
-    lock_passwd: false
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    plain_text_passwd: "P@ssw0rd"
-    ssh_authorized_keys:
-      - ssh-rsa ...
+main:
 
-packages:
-  - openssh-server
 
-runcmd:
-  - sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' /etc/ssh/sshd_config
-  - sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config
-  - systemctl restart sshd
+---
+- name: Настройка домена контроля, DNS, DHCP, веб-сервиса и межсетевого экранирования
+  hosts: server
+  become: yes
+
+  tasks:
+    - name: Установка необходимых пакетов через raw модуль
+      raw: |
+        apt-get update
+        apt-get install -y samba samba-dc bind bind-utils dhcp-server httpd iptables-services
+
+    - name: Настройка Samba AD DC
+      copy:
+        dest: /etc/samba/smb.conf
+        content: |
+          [global]
+            workgroup = EXAMPLE
+            realm = EXAMPLE.COM
+            netbios name = SRV
+            server role = active directory domain controller
+            dns forwarder = 8.8.8.8
+            idmap_ldb:use rfc2307 = yes
+
+    - name: Запуск и включение Samba
+      systemd:
+        name: samba
+        state: started
+        enabled: yes
+
+    - name: Инициализация домена Samba
+      command: samba-tool domain provision --use-rfc2307 --interactive
+      args:
+        stdin: |
+          EXAMPLE.COM
+          EXAMPLE
+          admin
+          P@ssw0rd
+          P@ssw0rd
+          y
+
+    - name: Настройка DNS (named)
+      copy:
+        dest: /etc/named.conf
+        content: |
+          options {
+            directory "/var/named";
+            forwarders { 8.8.8.8; };
+            allow-query { any; };
+            dnssec-validation no;
+          };
+          zone "example.com" {
+            type master;
+            file "example.com.zone";
+          };
+
+    - name: Создание зоны DNS
+      copy:
+        dest: /var/named/example.com.zone
+        content: |
+          $TTL 1D
+          @       IN SOA  example.com. admin.example.com. (
+                                          0   ; serial
+                                          1D  ; refresh
+                                          1H  ; retry
+                                          1W  ; expire
+                                          3H )    ; minimum
+                  NS      srv.example.com.
+                  A       10.10.100.100
+          srv     A       10.10.100.100
+          cli1    A       10.10.100.101
+          cli2    A       10.10.100.177
+
+    - name: Запуск и включение named
+      systemd:
+        name: named
+        state: started
+        enabled: yes
+
+    - name: Настройка DHCP сервера
+      copy:
+        dest: /etc/dhcp/dhcpd.conf
+        content: |
+          option domain-name "example.com";
+          option domain-name-servers 10.10.100.100;
+          default-lease-time 600;
+          max-lease-time 7200;
+          authoritative;
+          subnet 10.10.100.0 netmask 255.255.255.0 {
+            range 10.10.100.150 10.10.100.200;
+            option routers 10.10.100.1;
+          }
+          host cli1 {
+            hardware ethernet {{ hostvars['cli1']['ansible_default_ipv4']['macaddress'] }};
+            fixed-address 10.10.100.101;
+          }
+          host cli2 {
+            hardware ethernet {{ hostvars['cli2']['ansible_default_ipv4']['macaddress'] }};
+            fixed-address 10.10.100.177;
+          }
+
+    - name: Запуск и включение dhcpd
+      systemd:
+        name: dhcpd
+        state: started
+        enabled: yes
+
+    - name: Настройка веб-сервера
+      copy:
+        dest: /var/www/html/index.html
+        content: |
+          <html><body><h1>Welcome to EXAMPLE.COM domain</h1></body></html>
+
+    - name: Запуск и включение httpd
+      systemd:
+        name: httpd
+        state: started
+        enabled: yes
+
+    - name: Настройка iptables
+      raw: |
+        iptables -F
+        iptables -A INPUT -p tcp --dport 53 -j ACCEPT
+        iptables -A INPUT -p udp --dport 53 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 389 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 88 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 135 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 445 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 464 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 636 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 67 -j ACCEPT
+        iptables -A INPUT -p udp --dport 67 -j ACCEPT
+        iptables -A INPUT -p tcp --dport 80 -j ACCEPT
+        iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+        iptables -A INPUT -i lo -j ACCEPT
+        iptables -P INPUT DROP
+        iptables-save > /etc/sysconfig/iptables
+        systemctl enable iptables
+
+- name: Присоединение клиентов к домену
+  hosts: cli1,cli2
+  become: yes
+
+  tasks:
+    - name: Установка необходимых пакетов через raw модуль
+      raw: |
+        apt-get update
+        apt-get install -y samba-client winbind
+
+    - name: Настройка клиента для домена
+      copy:
+        dest: /etc/samba/smb.conf
+        content: |
+          [global]
+            workgroup = EXAMPLE
+            realm = EXAMPLE.COM
+            security = ads
+            idmap config * : backend = tdb
+            idmap config * : range = 10000-99999
+            winbind use default domain = yes
+            winbind offline logon = yes
+
+    - name: Присоединение к домену
+      command: net ads join -U admin%P@ssw0rd
+      register: join_result
+      failed_when: join_result.rc != 0
+
+    - name: Настройка Winbind
+      systemd:
+        name: winbind
+        state: started
+        enabled: yes
+
+    - name: Настройка resolv.conf
+      copy:
+        dest: /etc/resolv.conf
+        content: |
+          nameserver 10.10.100.100
+          search example.com
+
+
+
