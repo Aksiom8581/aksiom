@@ -1,6 +1,3 @@
-main:
-
-
 ---
 - name: Настройка домена контроля, DNS, DHCP, веб-сервиса и межсетевого экранирования
   hosts: server
@@ -10,36 +7,80 @@ main:
     - name: Установка необходимых пакетов через raw модуль
       raw: |
         apt-get update
-        apt-get install -y samba samba-dc bind bind-utils dhcp-server httpd iptables-services
+        apt-get install -y samba samba-dc bind bind-utils dhcp-server httpd iptables-services krb5-workstation
 
-    - name: Настройка Samba AD DC
+    - name: Создание конфигурации Kerberos
+      copy:
+        dest: /etc/krb5.conf
+        content: |
+          [libdefaults]
+            default_realm = EXAMPLE.COM
+            dns_lookup_realm = false
+            dns_lookup_kdc = true
+
+    - name: Предварительная настройка Samba (перед provisioning)
       copy:
         dest: /etc/samba/smb.conf
         content: |
           [global]
             workgroup = EXAMPLE
             realm = EXAMPLE.COM
-            netbios name = SRV
             server role = active directory domain controller
             dns forwarder = 8.8.8.8
             idmap_ldb:use rfc2307 = yes
+
+    - name: Инициализация домена Samba (проверка перед запуском)
+      command: |
+        samba-tool domain provision \
+          --realm=EXAMPLE.COM \
+          --domain=EXAMPLE \
+          --server-role=dc \
+          --use-rfc2307 \
+          --dns-backend=BIND9_DLZ \
+          --adminpass=P@ssw0rd
+      args:
+        creates: /var/lib/samba/private/krb5.conf
+
+    - name: Копирование конфига Kerberos из Samba
+      command: cp /var/lib/samba/private/krb5.conf /etc/krb5.conf
+      when: not ansible_check_mode
+
+    - name: Настройка systemd для Samba
+      copy:
+        dest: /etc/systemd/system/samba.service
+        content: |
+          [Unit]
+          Description=Samba Active Directory Domain Controller
+          After=network.target remote-fs.target nss-lookup.target
+
+          [Service]
+          Type=forking
+          ExecStart=/usr/sbin/samba -D
+          ExecReload=/usr/bin/kill -HUP $MAINPID
+          PIDFile=/run/samba.pid
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Перезагрузка демона systemd
+      systemd:
+        daemon_reload: yes
 
     - name: Запуск и включение Samba
       systemd:
         name: samba
         state: started
         enabled: yes
+      register: samba_start
+      retries: 3
+      delay: 10
+      until: samba_start is succeeded
 
-    - name: Инициализация домена Samba
-      command: samba-tool domain provision --use-rfc2307 --interactive
-      args:
-        stdin: |
-          EXAMPLE.COM
-          EXAMPLE
-          admin
-          P@ssw0rd
-          P@ssw0rd
-          y
+    - name: Проверка работы Samba
+      command: smbclient -L localhost -U%
+      register: samba_test
+      changed_when: false
+      failed_when: samba_test.rc != 0
 
     - name: Настройка DNS (named)
       copy:
@@ -72,6 +113,10 @@ main:
           srv     A       10.10.100.100
           cli1    A       10.10.100.101
           cli2    A       10.10.100.177
+
+    - name: Проверка синтаксиса конфига named
+      command: named-checkconf /etc/named.conf
+      changed_when: false
 
     - name: Запуск и включение named
       systemd:
@@ -143,24 +188,25 @@ main:
   hosts: cli1,cli2
   become: yes
 
+tasks:
+- name: Присоединение клиентов к домену
+  hosts: cli1,cli2
+  become: yes
+
   tasks:
     - name: Установка необходимых пакетов через raw модуль
       raw: |
         apt-get update
-        apt-get install -y samba-client winbind
+        apt-get install -y samba-client winbind krb5-workstation
 
-    - name: Настройка клиента для домена
+    - name: Настройка Kerberos на клиенте
       copy:
-        dest: /etc/samba/smb.conf
+        dest: /etc/krb5.conf
         content: |
-          [global]
-            workgroup = EXAMPLE
-            realm = EXAMPLE.COM
-            security = ads
-            idmap config * : backend = tdb
-            idmap config * : range = 10000-99999
-            winbind use default domain = yes
-            winbind offline logon = yes
+          [libdefaults]
+            default_realm = EXAMPLE.COM
+            dns_lookup_realm = false
+            dns_lookup_kdc = true
 
     - name: Присоединение к домену
       command: net ads join -U admin%P@ssw0rd
@@ -179,6 +225,3 @@ main:
         content: |
           nameserver 10.10.100.100
           search example.com
-
-
-
